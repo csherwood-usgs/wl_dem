@@ -5,13 +5,14 @@ wave forcing and Stockdon et al. (2006) runup, and two camera-pointing checks
 (sea horizon vs. calibration; feature-based rotation vs. a reference image).
 
 Quality index: 0 = night, 1 = too blurry (fog, rain, sand on lens), 2 = sharp but sunglint,
-4 = sharp, high quality. NaN = no calibration for that station/time.
+4 = sharp, high quality. -1 = unreadable (empty or corrupt) file. NaN = no calibration for that station/time.
 
 The feature-based pointing check follows the idea in emarsjanik/marconi-camera-dem
 (pointing_check.py): a camera that has only rotated relates the two views by a pure rotation,
 found from matched viewing rays with the Kabsch (1976) solution inside RANSAC.
 """
 from pathlib import Path
+import re
 import numpy as np
 import pandas as pd
 import cv2
@@ -29,7 +30,7 @@ THRESH = {'dark': 40.,    # mean gray (0-255) below which image is night
           'sat': 250,     # gray value counted as saturated
           'sea_band': 400,  # rows (full res) below horizon used for glint test
           'hz_win': 150,  # +/- rows searched for the horizon edge
-          'hz_ref': 8.,   # max |horizon offset| (px) for an image to serve as pointing reference
+          'hz_ref': 2.,   # max horizon-fit residual (px) for an image to serve as pointing reference
           'pt_every': pd.Timedelta('60min'),  # min time between pointing checks per camera
           'pt_scale': 0.5,  # image scale for SIFT
           'pt_min_inliers': 40}
@@ -41,10 +42,15 @@ def image_time(path):
     return pd.Timestamp(int(Path(path).name.split('.')[0]), unit='s')
 
 
+def station_name(s):
+    """Station name as used in the calibration table: caco-03, CACO.03, caco03 -> CACO03."""
+    return re.sub(r'[^A-Z0-9]', '', s.upper())
+
+
 def list_timex(root, stations, cams=('c1', 'c2'), t0=None, t1=None):
-    """Table of timex images under root/station/cam/<day folder>/, sorted by time."""
-    rows = [(image_time(p), st.upper().replace('-', ''), cam, str(p))
-            for st in stations for cam in cams for p in Path(root, st, cam).glob('*/*.timex.*')]
+    """Table of timex images anywhere under root/station/cam/ (e.g. cam/2024/352_Dec.17/), sorted by time."""
+    rows = [(image_time(p), station_name(st), cam, str(p))
+            for st in stations for cam in cams for p in Path(root, st, cam).rglob('*.timex.*')]
     df = pd.DataFrame(rows, columns=['time', 'station', 'camera', 'path']).sort_values(['time', 'camera'])
     if t0 is not None:
         df = df[(df.time >= t0) & (df.time <= t1)]
@@ -56,8 +62,10 @@ def read_calib_table(path):
     t = pd.read_csv(path).iloc[:, :8]
     t.columns = ['start', 'end', 'c1', 'c1_EO', 'c1_IO', 'c2', 'c2_EO', 'c2_IO']
     t = t.dropna(subset=['start'])
-    t['start'] = pd.to_datetime(t.start, format='%m/%d/%Y')
-    t['end'] = pd.to_datetime(t.end, format='%m/%d/%Y').fillna(pd.Timestamp('2100-01-01'))
+    for c in ['c1', 'c1_EO', 'c1_IO', 'c2', 'c2_EO', 'c2_IO']:
+        t[c] = t[c].str.strip()
+    t['start'] = pd.to_datetime(t.start, format='mixed')    # accepts 2/10/2021 and 2021-02-10
+    t['end'] = pd.to_datetime(t.end, format='mixed').fillna(pd.Timestamp('2100-01-01'))
     return t.reset_index(drop=True)
 
 
@@ -281,6 +289,8 @@ def classify(brightness, sharpness, glint_frac, th):
 def scan_image(path, io, eo, sun_el, sun_az, th):
     """Quality metrics and horizon check for one image. Returns (dict, gray image, predicted horizon)."""
     gray = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if gray is None:                     # empty or corrupt file
+        return {'quality': -1, 'sun_el': sun_el, 'sun_az': sun_az}, None, None
     small = cv2.resize(gray, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
     r = {'brightness': small.mean(), 'sun_el': sun_el, 'sun_az': sun_az}
     if r['brightness'] < th['dark']:
@@ -303,53 +313,67 @@ def scan_image(path, io, eo, sun_el, sun_az, th):
 
 
 def scan(imgs, waves, table, calib_dir, out_csv, lat, lon, beta=0.12, th=THRESH, checkpoint=200):
-    """Scan images (from list_timex) in time order; write/append rows to out_csv. Resumes by skipping
-    paths already in out_csv. Pointing deltas (d_az, d_tilt, d_roll, deg) are relative to the
-    calibration EO, via a reference image for each camera and EO file: the first quality-4 image
-    whose horizon matches the calibration within th['hz_ref'] px (flagged is_ref)."""
+    """Scan images (from list_timex) in time order: calibration files, waves and runup, quality metrics and
+    horizon check. Writes/appends rows to out_csv and resumes by skipping paths already in it.
+    Pointing columns are filled afterward by pointing_pass()."""
     done = pd.read_csv(out_csv, parse_dates=['time']) if Path(out_csv).exists() else pd.DataFrame(columns=['path'])
     imgs = imgs[~imgs.path.isin(done.path)].reset_index(drop=True)
     imgs = pd.concat([imgs, wave_forcing(waves, imgs.time, beta)], axis=1)
     imgs['sun_el'], imgs['sun_az'] = sun_position(imgs.time, lat, lon)
-    cal, refs, last_pt, rows = {}, {}, {}, []
-    for _, r in (done[done.is_ref == True] if 'is_ref' in done else done).iterrows():   # rebuild references
-        io, eo = read_yaml(Path(calib_dir, r.io_file)), read_yaml(Path(calib_dir, r.eo_file))
-        g = cv2.imread(r.path, cv2.IMREAD_GRAYSCALE)
-        pts, des = features(g, land_mask(g.shape, horizon_rows(io, eo, np.arange(0, g.shape[1], 50))), th['pt_scale'])
-        refs[(r.camera, r.eo_file)] = {'pts': pts, 'des': des, 'path': r.path,
-                                       'R': CIRNangles2R(*np.radians([eo['azimuth'], eo['tilt'], eo['roll']]))}
+    cal, rows = {}, []
     for i, im in imgs.iterrows():
         eo_file, io_file = calib_files(table, im.time, im.station, im.camera)
-        row = im.to_dict() | {'eo_file': eo_file, 'io_file': io_file, 'quality': np.nan, 'is_ref': False}
+        row = im.to_dict() | {'eo_file': eo_file, 'io_file': io_file, 'quality': np.nan}
         if eo_file is not None:
             if eo_file not in cal:
                 cal[eo_file] = (read_yaml(Path(calib_dir, io_file)), read_yaml(Path(calib_dir, eo_file)))
-            io, eo = cal[eo_file]
-            m, gray, pred = scan_image(im.path, io, eo, im.sun_el, im.sun_az, th)
-            row |= m
-            key = (im.camera, eo_file)
-            due = im.time - last_pt.get(im.camera, pd.Timestamp(0)) >= th['pt_every']
-            if m['quality'] >= 2 and (due or key not in refs):
-                full = horizon_rows(io, eo, np.arange(0, gray.shape[1], 50))
-                pts, des = features(gray, land_mask(gray.shape, full), th['pt_scale'])
-                if key not in refs and m['quality'] == 4 and abs(m['hz_offset']) < th['hz_ref']:
-                    refs[key] = {'pts': pts, 'des': des, 'path': im.path,
-                                 'R': CIRNangles2R(*np.radians([eo['azimuth'], eo['tilt'], eo['roll']]))}
-                    row['is_ref'] = True
-                if key in refs:
-                    n, az, tilt, roll = pointing(refs[key], pts, des, io)
-                    ok = n >= th['pt_min_inliers']
-                    row |= {'pt_inliers': n, 'pt_ref': Path(refs[key]['path']).name,
-                            'd_az': ((az - eo['azimuth'] + 180) % 360 - 180) if ok else np.nan,
-                            'd_tilt': tilt - eo['tilt'] if ok else np.nan,
-                            'd_roll': roll - eo['roll'] if ok else np.nan}
-                    last_pt[im.camera] = im.time
+            row |= scan_image(im.path, *cal[eo_file], im.sun_el, im.sun_az, th)[0]
         rows.append(row)
         if len(rows) == checkpoint or i == len(imgs) - 1:
             write_rows(rows, out_csv)
             print(f'{i + 1}/{len(imgs)}  {im.time}')
             rows = []
     return pd.read_csv(out_csv, parse_dates=['time'])
+
+
+def pointing_pass(df, calib_dir, th=THRESH):
+    """Camera rotation (d_az, d_tilt, d_roll, deg) of quality-4 images, at most one per th['pt_every'] per camera,
+    relative to a reference image for each camera and EO file: the first quality-4 image whose horizon is
+    found cleanly (hz_fit_px < th['hz_ref']), flagged is_ref. The reference need not match the calibration;
+    its own horizon fit (hz_dtilt, hz_droll) tells how well the calibration fits at that time.
+    Returns df with the pointing columns replaced."""
+    df = df.copy()
+    for c in ['pt_ref', 'pt_inliers', 'd_az', 'd_tilt', 'd_roll']:
+        df[c] = np.nan
+    df['pt_ref'] = df.pt_ref.astype(object)
+    df['is_ref'] = False
+    for (cam, eo_file), g in df[df.quality == 4].sort_values('time').groupby(['camera', 'eo_file']):
+        io, eo = read_yaml(Path(calib_dir, g.io_file.iloc[0])), read_yaml(Path(calib_dir, eo_file))
+        R0 = CIRNangles2R(*np.radians([eo['azimuth'], eo['tilt'], eo['roll']]))
+        mask = None
+        cand = g[g.hz_fit_px < th['hz_ref']]
+        if len(cand) == 0:
+            print(f'{cam} {eo_file}: no image with a clean horizon for a reference')
+            continue
+        ri = cand.index[0]
+        keep = g.time.dt.floor(th['pt_every']).drop_duplicates().index.union([ri])
+        ref = None
+        for i in [ri] + [k for k in keep if k != ri]:
+            gray = cv2.imread(df.path[i], cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                mask = land_mask(gray.shape, horizon_rows(io, eo, np.arange(0, gray.shape[1], 50)))
+            pts, des = features(gray, mask, th['pt_scale'])
+            if ref is None:
+                ref = {'pts': pts, 'des': des, 'R': R0}
+                df.loc[i, 'is_ref'] = True
+            n, az, tilt, roll = pointing(ref, pts, des, io)
+            df.loc[i, ['pt_ref', 'pt_inliers']] = [Path(df.path[ri]).name, n]
+            if n >= th['pt_min_inliers']:
+                df.loc[i, ['d_az', 'd_tilt', 'd_roll']] = [(az - eo['azimuth'] + 180) % 360 - 180,
+                                                          tilt - eo['tilt'], roll - eo['roll']]
+        print(f'{cam} {eo_file}: reference {df.time[ri]}, horizon fit at reference dtilt {df.hz_dtilt[ri]:+.2f}, '
+              f'droll {df.hz_droll[ri]:+.2f} (deg); {len(keep)} images checked')
+    return df
 
 
 COLS = ['time', 'quality', 'wh_4061', 'wp_peak', 'R2', 'path', 'station', 'camera', 'wvdir', 'water_level',
@@ -367,10 +391,13 @@ def write_rows(rows, out_csv):
 def eo_changes(df, calib_dir, tol=0.15, min_inliers=40):
     """Group daily median pointing changes into runs of constant pointing per camera and EO file.
     A new run starts when a day's median differs from the running run median by more than tol (deg)
-    in any angle. Returns one row per run with the changes and the implied new angles (not applied)."""
+    in any angle. d_az, d_tilt, d_roll are changes since the reference image (first run = 0), and moved is
+    True when any exceeds tol. azimuth, tilt, roll = calibration + change, i.e. assume the reference matched
+    the calibration; hz_dtilt, hz_droll (horizon fit vs. calibration) test that. Nothing is applied."""
     d = df[df.pt_inliers >= min_inliers].copy()
     d['day'] = d.time.dt.floor('D')
     daily = d.groupby(['camera', 'eo_file', 'day'])[['d_az', 'd_tilt', 'd_roll', 'hz_dtilt', 'hz_droll']].median().reset_index()
+    io_file = d.groupby(['camera', 'eo_file']).io_file.first()
     out = []
     for (cam, eo_file), g in daily.groupby(['camera', 'eo_file']):
         eo = read_yaml(Path(calib_dir, eo_file))
@@ -380,7 +407,7 @@ def eo_changes(df, calib_dir, tol=0.15, min_inliers=40):
             if r is not None and (np.abs(r[['d_az', 'd_tilt', 'd_roll']] - med[['d_az', 'd_tilt', 'd_roll']]) <= tol).all():
                 run.append(r)
                 continue
-            out.append({'camera': cam, 'eo_file': eo_file, 'first_day': run[0].day.date(), 'last_day': run[-1].day.date(),
+            out.append({'camera': cam, 'eo_file': eo_file, 'io_file': io_file[cam, eo_file], 'first_day': run[0].day.date(), 'last_day': run[-1].day.date(),
                         'n_days': len(run), 'd_az': med.d_az, 'd_tilt': med.d_tilt, 'd_roll': med.d_roll,
                         'hz_dtilt': med.hz_dtilt, 'hz_droll': med.hz_droll,
                         'azimuth': eo['azimuth'] + med.d_az, 'tilt': eo['tilt'] + med.d_tilt, 'roll': eo['roll'] + med.d_roll,
