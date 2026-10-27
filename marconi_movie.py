@@ -1,9 +1,10 @@
-# csherwood@usgs.gov, 2026-10-26, generated with Claude Opus 5.5
+# csherwood@usgs.gov, 2026-10-26, generated with Claude Opus 5.5 (survey lines and pixel instruments added 2026-10-27)
 """
 Movie frames of the daily Marconi DEMs (from the GeoTIFFs written by marconi_dem.run_days) and .avi assembly.
-Each frame: a Hs and b water level (static, with a bar at the DEM day), then c elevation with 1 m contours,
-d change from the previous non-empty DEM (blue accretion, red erosion), and e uncertainty, all at the same
-scale and bounds.
+Each frame: a Hs and b water level (static, with a bar at the DEM day and thick light gray lines at the
+beach-survey dates), then c elevation with 1 m contours, d change from the previous non-empty DEM (blue
+accretion, red erosion), and e uncertainty, all at the same scale and bounds, with the rectified
+pixel-instrument transects if given.
 """
 from pathlib import Path
 import numpy as np
@@ -11,6 +12,8 @@ import pandas as pd
 import cv2
 import matplotlib.pyplot as plt
 import rasterio
+
+SURVEYS = pd.to_datetime(['2025-01-23', '2025-03-06'])   # dates of beach surveys
 
 MOVIE = {'xlim': (None, 420200.),   # map bounds (m); None = from the extent of data in all DEMs
          'ylim': (None, None),
@@ -20,8 +23,15 @@ MOVIE = {'xlim': (None, 420200.),   # map bounds (m); None = from the extent of 
          'siglim': (0., 0.3),       # uncertainty color limits (m)
          'contours': 1.,            # contour interval (m)
          'window': True,            # shade the three-day window in a and b
+         'pix_colors': {'c1': 'w', 'c2': 'tab:orange'},
          'figsize': (10, 13),       # constant frame size (in)
          'dpi': 100}
+
+
+def mark_surveys(ax, days=SURVEYS):
+    """Thick light gray vertical lines at the survey days (noon), behind the data."""
+    for d in days:
+        ax.axvline(d + pd.Timedelta('12h'), c='0.85', lw=6, zorder=0)
 
 
 def read_tif(path):
@@ -46,8 +56,9 @@ def data_bounds(dem_dir, days, cfg=MOVIE):
     return xl, yl
 
 
-def frame(path, day, dem_dir, waves, prev_day, xl, yl, title='', cfg=MOVIE):
-    """One five-panel movie frame saved as PNG. prev_day: date of the DEM to difference against, or None."""
+def frame(path, day, dem_dir, waves, prev_day, xl, yl, title='', cfg=MOVIE, pix=None):
+    """One five-panel movie frame saved as PNG. prev_day: date of the DEM to difference against, or None.
+    pix: optional table (camera, x, y) of rectified pixel-instrument positions drawn on c, d and e."""
     g, x, y = read_tif(Path(dem_dir, f'dem_{day:%Y-%m-%d}.tif'))
     s = read_tif(Path(dem_dir, f'unc_{day:%Y-%m-%d}.tif'))[0]
     dz = g - read_tif(Path(dem_dir, f'dem_{prev_day:%Y-%m-%d}.tif'))[0] if prev_day is not None else np.full_like(g, np.nan)
@@ -64,6 +75,7 @@ def frame(path, day, dem_dir, waves, prev_day, xl, yl, title='', cfg=MOVIE):
     a.set_ylabel(r'$H_s$ (m)')
     b.set_ylabel('Water level (m)')
     for ax in (a, b):
+        mark_surveys(ax)
         ax.axvline(day + pd.Timedelta('12h'), c='tab:red', lw=2)
         if cfg['window']:
             ax.axvspan(day - pd.Timedelta('1D'), day + pd.Timedelta('2D'), color='tab:red', alpha=0.12, lw=0)
@@ -83,6 +95,9 @@ def frame(path, day, dem_dir, waves, prev_day, xl, yl, title='', cfg=MOVIE):
     m[1].set_title(f'minus {prev_day:%Y-%m-%d}' if prev_day is not None else 'no earlier DEM', fontsize=9)
     m[2].set_title(f'{day:%Y-%m-%d}', fontsize=9)
     for ax, i, lab in zip(m, im, labels):
+        if pix is not None:
+            for cam, p in pix.groupby('camera'):
+                ax.plot(p.x, p.y, c=cfg['pix_colors'].get(cam, 'k'), lw=1)
         ax.set_xlim(xl)
         ax.set_ylim(yl)
         ax.set_aspect('equal')
@@ -102,14 +117,17 @@ def frame(path, day, dem_dir, waves, prev_day, xl, yl, title='', cfg=MOVIE):
     plt.close(fig)
 
 
-def make_frames(dem_dir, frame_dir, days, waves, status=None, cfg=MOVIE):
+def make_frames(dem_dir, frame_dir, days, waves, status=None, cfg=MOVIE, pix=None):
     """Frames for all days (frame_####.png). The change panel uses the previous day with a non-empty DEM.
-    status: optional dict day -> title text. Returns list of frame paths."""
+    status: optional dict day -> title text. pix: optional table (day, camera, x, y) of rectified pixel
+    instruments; each frame uses that day's rows. Returns list of frame paths."""
     xl, yl = data_bounds(dem_dir, days, cfg)
+    pg = pix.groupby(pd.to_datetime(pix.day)) if pix is not None else None
     prev, paths = None, []
     for i, d in enumerate(days):
         p = Path(frame_dir, f'frame_{i:04d}.png')
-        frame(p, d, dem_dir, waves, prev, xl, yl, (status or {}).get(d, ''), cfg)
+        pd_ = pg.get_group(d) if pg is not None and d in pg.groups else None
+        frame(p, d, dem_dir, waves, prev, xl, yl, (status or {}).get(d, ''), cfg, pd_)
         if np.isfinite(read_tif(Path(dem_dir, f'dem_{d:%Y-%m-%d}.tif'))[0]).any():
             prev = d
         paths.append(p)
@@ -122,7 +140,7 @@ def write_avi(paths, out, fps=4):
     h, w = cv2.imread(str(paths[0])).shape[:2]
     vw = cv2.VideoWriter(str(out), cv2.CAP_OPENCV_MJPEG, cv2.VideoWriter_fourcc(*'MJPG'), fps, (w, h))
     if not vw.isOpened():
-        raise RuntimeError(f'cannot open {out} for writing')
+        raise IOError(f'could not open {out} for writing')
     for p in paths:
         vw.write(cv2.resize(cv2.imread(str(p)), (w, h)))
     vw.release()
