@@ -1,4 +1,4 @@
-# csherwood@usgs.gov, 2026-10-27, generated with Claude Opus 5.5 (hand-picked and color prompts added 2026-10-28)
+# csherwood@usgs.gov, 2026-10-27, generated with Claude Opus 5.5 (hand-picked and class prompts added 2026-10-28; var and bright 2026-10-29)
 """
 Waterline detection with the Segment Anything Model (SAM; Kirillov et al., 2023), run in parallel with the
 Otsu color-index detector in marconi_dem, plus a pixel-distance comparison of the two.
@@ -13,8 +13,8 @@ Hand-picked prompts (marconi_prompts / sam_prompts.ipynb) replace the geometric 
 cover: land points are background, water points foreground, and the polygon they outline limits where the
 waterline may be. Periods without hand-picked prompts fall back to the geometric prompts.
 
-With a color model (marconi_color) as well, each image also gets prompts on either side of its own
-sand / (whitewater + water) color boundary, SAM returns its three candidate masks, and the one that agrees best
+With a class model (marconi_color; timex color plus var and bright images) as well, each image also gets
+prompts on either side of its own dry (sand, snow) / wet (whitewater, water) boundary, SAM returns its three candidate masks, and the one that agrees best
 with the color classes (intersection over union of the wet region inside the polygon) is kept. This keeps
 whitewater with the sea, so the waterline is not drawn at the outer edge of the surf zone.
 
@@ -85,8 +85,8 @@ def detect_waterline_sam(path, io, eo, predictor, cfg=SAM_CFG, prompt=None, mode
         roi = mc.poly_mask(poly, (nv, nu), s)
         multi = cfg['multimask']
         if model is not None:
-            post, _ = mc.classify(img, prompt, model, ccfg | {'scale': s})
-            wet = mc.wet_region(post, roi, pts[lab == 1], ccfg | {'scale': s})
+            post, _ = mc.classify(path, prompt, model, ccfg | {'scale': s})
+            wet = mc.wet_region(post, roi, pts[lab == 1], model, ccfg | {'scale': s})
             cp, cl = mc.color_prompts(wet, roi, pts[lab == 0], ccfg | {'scale': s})
             pts, lab, multi = np.vstack([pts, cp]), np.r_[lab, cl], True
     if lab.sum() == 0:
