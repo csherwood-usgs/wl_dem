@@ -1,13 +1,15 @@
 """
 marconi_runup.py
-csherwood@usgs.gov, 2026-11-13, generated with Claude Opus 5.5
+csherwood@usgs.gov, 2026-11-13 (revised 2026-11-16), generated with Claude Opus 5.5
 
 Rough waterline excursion (swash) statistics from CoastCam timestacks, mapped onto profiles of the daily
 contour-map DEMs along the timestack pixel instruments.
 
 Steps, for each timestack (*.ras.tiff, rows = time at 2 Hz, columns = pixel-instrument pixels):
-1. Split the timestack and the .pix file into transects with the ShoreScan routines
-   (utils_runup.process_and_split_image, utils_runup.split_and_save_pixcoordinates).
+1. Pick the .pix file valid at the timestack time from the ShoreScan camera_settings.json
+   (read_camera_settings, utils_runup.get_coordinate_file_for_timestamp; .pix files are found by name in pix_dir),
+   and split the .pix file (utils_runup.split_and_save_pixcoordinates, once per .pix file,
+   YAML transect files) and the timestack (utils_runup.process_and_split_image, PNG transect images) into transects.
 2. Rectify each transect's U, V pixels onto that day's DEM (dem_YYYY-MM-DD.tif) with the ShoreScan CIRN routines
    (utils_CIRN.dist_uv_to_xyz at z = 0, then utils_CIRN.get_elevations, ray marching to the DEM surface), using
    the calibration valid at the timestack time (marconi_scan.calib_files).
@@ -20,15 +22,17 @@ Steps, for each timestack (*.ras.tiff, rows = time at 2 Hz, columns = pixel-inst
 4. Map the waterline time series onto the profile, z(t), and report min, 2nd percentile, median, 98th percentile,
    max, and 4 std(z) (a rough significant swash), plus excursions above the measured water level.
 
-Timestacks with no calibration in the table are skipped (status 'no calibration'). That is intended: at CACO03 a guy
-wire broke on 2025-01-04 and the cameras moved, then moved again when it was reattached on 2025-01-07, so no
-calibration applies between those dates.
+Timestacks are skipped (with the reason in the status column) when there is no calibration, no .pix file, or the
+timestack width differs from the number of .pix pixels. No calibration is expected for 2025-01-04 to 2025-01-07: at
+CACO03 a guy wire broke on 2025-01-04 and the cameras moved, then moved again when it was reattached on 2025-01-07.
 
 This is a quick estimate of the swash range, not a runup analysis (the SegFormer workflow does that).
 The 98th percentile is of the whole waterline series, like eta2 in utils_runup.runupStatistics_CHI,
 not of the runup maxima (R2).
 """
 from pathlib import Path
+from datetime import datetime
+import json
 import numpy as np
 import pandas as pd
 import cv2
@@ -36,6 +40,7 @@ import yaml
 import rioxarray
 import matplotlib.pyplot as plt
 from scipy.ndimage import median_filter
+from PIL import Image
 
 import utils_CIRN
 import utils_runup
@@ -43,7 +48,6 @@ import marconi_scan as ms
 
 RUNUP = {'jump': 100,          # pixel distance between .pix rows that starts a new transect (utils_runup threshold)
          'jump_rel': None,     # optional: also split at jumps > jump_rel * median step (None = jump only, as ShoreScan)
-         'reverse': {'c1': False, 'c2': False},   # reverse_flag of the ShoreScan camera settings
          'dark': 40.,          # mean gray (0-255) below which a timestack is skipped (night)
          'blur': 5,            # median filter (px) on the color index before thresholding
          'land_frac': 0.1,     # landward fraction of the transect used as the dry-sand reference
@@ -76,8 +80,9 @@ def append_csv(rows, csv, cols):
 
 # ------------------------------------------------------------------ files
 def list_timestacks(root, stations, cams=('c1', 'c2'), t0=None, t1=None):
-    """Table of timestacks (*.ras.tif*) under root/station/cam/ (any depth), sorted by time."""
-    rows = [(ms.image_time(p), ms.station_name(st), cam, str(p))
+    """Table of timestacks (*.ras.tif*) under root/station/cam/ (any depth), sorted by time. The station is taken
+    from the file name (e.g. ...GMT.2025.CACO03.c1.ras.tiff), as in ShoreScan, not from the folder."""
+    rows = [(ms.image_time(p), ms.station_name(p.name.split('.')[6]), cam, str(p))
             for st in stations for cam in cams for p in Path(root, st, cam).rglob('*.ras.tif*')]
     df = pd.DataFrame(rows, columns=['time', 'station', 'camera', 'path']).sort_values(['time', 'camera'])
     if t0 is not None:
@@ -183,22 +188,49 @@ def excursion(ri, prof, nx, hz=RUNUP['hz']):
     return pd.DataFrame({'t': np.arange(ri.size) / hz, 'ri': ri, 'x': x, 'y': y, 'z': z}), st
 
 
+# ------------------------------------------------------------------ pixel instruments
+def read_camera_settings(path, pix_dir=None):
+    """ShoreScan camera settings {station: {camera: {'reverse_flag', 'coordinate_files': {(start, end): .pix path}}}},
+    parsed as in utils_runup.get_camera_settings (without its file dialog). The .pix files are found by name in pix_dir
+    (default: the folder of the JSON file); folders in the JSON (e.g. DATA/) are ignored."""
+    cs = json.load(open(path))
+    d = Path(pix_dir or Path(path).parent)
+    for st in cs.values():
+        for c in st.values():
+            c['coordinate_files'] = {tuple(datetime.fromisoformat(t) for t in k.split('|')): str(d / Path(v).name)
+                                     for k, v in c['coordinate_files'].items()}
+    return cs
+
+
+def pix_for(r, cam_set):
+    """(.pix path or None, reverse flag) valid for a timestack row (station, camera, time)."""
+    c = cam_set.get(r.station, {}).get(r.camera)
+    f = utils_runup.get_coordinate_file_for_timestamp(c, r.time.to_pydatetime()) if c else None
+    return (Path(f) if f else None), (c or {}).get('reverse_flag', False)
+
+
+def width_survey(ts, cam_set):
+    """ts with the .pix file, its number of pixels, and the timestack width (from the TIFF header only;
+    NaN for a TIFF that cannot be read)."""
+    npix, rows = {}, []
+    for r in ts.itertuples():
+        p, _ = pix_for(r, cam_set)
+        if p is not None and p not in npix:
+            npix[p] = len(np.loadtxt(p))
+        try:
+            w = Image.open(r.path).size[0]
+        except OSError:          # corrupt timestack file
+            w = np.nan
+        rows.append((p.name if p else None, npix.get(p, np.nan), w))
+    return ts.assign(**dict(zip(['pix_file', 'n_pix', 'width'], zip(*rows))))
+
+
 # ------------------------------------------------------------------ driver
-def pix_for(r, pix_files, cam_set, cfg=RUNUP):
-    """(.pix path, reverse flag) for a timestack row: from the ShoreScan camera settings (utils_runup) if given,
-    else pix_files[camera] and cfg['reverse']."""
-    if cam_set:
-        c = cam_set[r.station][r.camera]
-        return Path(utils_runup.get_coordinate_file_for_timestamp(c, r.time.to_pydatetime())), c.get('reverse_flag', False)
-    return Path(pix_files[r.camera]), cfg['reverse'][r.camera]
-
-
-def process_all(ts, calib_dir, calib_table, pix_files, dem_dir, scan, out_dir, cfg=RUNUP, fig_dir=None,
-                fig_every=0, cam_set=None):
+def process_all(ts, calib_dir, calib_table, cam_set, dem_dir, scan, out_dir, cfg=RUNUP, fig_dir=None, fig_every=0):
     """Process timestack table ts (from list_timestacks); appends to out_dir/runup_excursion.csv and
     out_dir/runup_profiles.csv and resumes if rerun. Waterline series go to out_dir/timestacks/series.
-    pix_files: {camera: .pix path}, or cam_set: camera settings from utils_runup.get_camera_settings
-    (date-dependent .pix files). With fig_dir and fig_every > 0, a figure for every fig_every-th timestack transect."""
+    cam_set: camera settings from read_camera_settings (date-dependent .pix files).
+    With fig_dir and fig_every > 0, a figure for every fig_every-th timestack transect."""
     png_dir, yaml_dir, ser_dir = (Path(out_dir, 'timestacks', d) for d in ['png', 'pix_yaml', 'series'])
     for d in [png_dir, yaml_dir, ser_dir]:
         d.mkdir(parents=True, exist_ok=True)
@@ -210,20 +242,22 @@ def process_all(ts, calib_dir, calib_table, pix_files, dem_dir, scan, out_dir, c
     cols = out_cols(cfg)
     for r in ts[~ts.path.isin(done)].itertuples():
         eo_f, io_f = ms.calib_files(calib_table, r.time, r.station, r.camera)
-        I0 = cv2.imread(r.path)
-        rec = {'time': r.time, 'station': r.station, 'camera': r.camera, 'path': r.path, 'eo_file': eo_f}
-        pix_path, rev = pix_for(r, pix_files, cam_set, cfg)
-        rec['pix_file'] = pix_path.name
+        pix_path, rev = pix_for(r, cam_set)
+        rec = {'time': r.time, 'station': r.station, 'camera': r.camera, 'path': r.path, 'eo_file': eo_f,
+               'pix_file': pix_path.name if pix_path else None}
         g = sc.get(r.camera)
         if g is not None:
             tt = g.time.values.astype('int64')
             rec |= {c: np.interp(np.int64(r.time.value), tt, g[c]) for c in cfg['wl_cols'] if c in g}
-        if pix_path not in pix:
-            pix[pix_path] = split_pix(pix_path, yaml_dir, rev, cfg)
-        npix = sum(u.size for u, _ in pix[pix_path].values())
-        if eo_f is None or I0 is None or I0.shape[1] != npix or I0.mean() < cfg['dark']:
-            why = ('no calibration' if eo_f is None else 'unreadable' if I0 is None else
-                   f'width {I0.shape[1]} != {npix} pix' if I0.shape[1] != npix else 'dark')
+        why = 'no calibration' if eo_f is None else 'no pix file' if pix_path is None else None
+        if why is None:
+            if pix_path not in pix:
+                pix[pix_path] = split_pix(pix_path, yaml_dir, rev, cfg)
+            npix = sum(u.size for u, _ in pix[pix_path].values())
+            I0 = cv2.imread(r.path)
+            why = ('unreadable' if I0 is None else f'width {I0.shape[1]} != {npix} pix' if I0.shape[1] != npix
+                   else 'dark' if I0.mean() < cfg['dark'] else None)
+        if why:
             append_csv([rec | {'status': why}], csv, cols)
             continue
         if eo_f not in cal:
@@ -269,12 +303,14 @@ def process_all(ts, calib_dir, calib_table, pix_files, dem_dir, scan, out_dir, c
 
 
 # ------------------------------------------------------------------ figures
-def plot_pix_periods(fig_dir, ts, scan, calib_table, pix_files, cam_set=None, cfg=RUNUP, tz='America/New_York'):
-    """One figure per camera and calibration period in ts: the .pix transects, numbered, on the sharpest timex image
-    of that period closest to local noon (scan quality 4 when scan has a quality column). Returns the figure paths."""
-    ts = ts.assign(eo_file=[ms.calib_files(calib_table, r.time, r.station, r.camera)[0] for r in ts.itertuples()])
+def plot_pix_periods(fig_dir, ts, scan, calib_table, cam_set, cfg=RUNUP, tz='America/New_York'):
+    """One figure per camera, calibration period, and .pix file in ts: the .pix transects, numbered, on the sharpest
+    timex image of that period closest to local noon (scan quality 4 when scan has a quality column).
+    Returns the figure paths."""
+    ts = ts.assign(eo_file=[ms.calib_files(calib_table, r.time, r.station, r.camera)[0] for r in ts.itertuples()],
+                   pix=[str(pix_for(r, cam_set)[0]) for r in ts.itertuples()])
     paths = []
-    for (c, eo), g in ts.dropna(subset=['eo_file']).groupby(['camera', 'eo_file']):
+    for (c, eo, _), g in ts[ts.pix != 'None'].dropna(subset=['eo_file']).groupby(['camera', 'eo_file', 'pix']):
         w = scan[(scan.camera == c) & (scan.time >= g.time.min()) & (scan.time <= g.time.max())]
         if 'quality' in w:
             w = w[w.quality == w.quality.max()]
@@ -282,7 +318,7 @@ def plot_pix_periods(fig_dir, ts, scan, calib_table, pix_files, cam_set=None, cf
             continue
         loc = w.time.dt.tz_localize('UTC').dt.tz_convert(tz)
         r = w.iloc[np.argmin(np.abs(loc.dt.hour + loc.dt.minute / 60 - 12))]
-        pix_path, rev = pix_for(g.iloc[0], pix_files, cam_set, cfg)
+        pix_path, rev = pix_for(g.iloc[0], cam_set)
         p = np.loadtxt(pix_path)[::-1 if rev else 1]
         jumps = np.where(np.hypot(*np.diff(p, axis=0).T) > split_threshold(pix_path, cfg))[0] + 1
         edges = np.r_[0, jumps, len(p)]
@@ -300,7 +336,7 @@ def plot_pix_periods(fig_dir, ts, scan, calib_table, pix_files, cam_set=None, cf
                      f'{pix_path.name}: {len(edges) - 1} transects, {np.diff(edges).tolist()} px (circle = first pixel); '
                      f'image {Path(r.path).name}', fontsize=9)
         fig.tight_layout()
-        path = Path(fig_dir, f'pix_transects_{c}_{Path(eo).stem}.png')
+        path = Path(fig_dir, f'pix_transects_{c}_{Path(eo).stem}_{pix_path.stem}.png')
         fig.savefig(path, dpi=130)
         plt.close(fig)
         paths.append(path)
